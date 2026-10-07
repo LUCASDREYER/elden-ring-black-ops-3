@@ -1,0 +1,9 @@
+[package]
+name = "cod-assets"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode"] }
+tiff = "0.11"

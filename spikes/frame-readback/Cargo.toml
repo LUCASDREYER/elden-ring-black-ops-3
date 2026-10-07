@@ -1,0 +1,13 @@
+[package]
+name = "frame-readback"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wgpu = { version = "30", default-features = false, features = ["metal", "wgsl", "std"] }
+pollster = "1"
+memmap2 = "0.9"
+
+[profile.release]
+debug = false

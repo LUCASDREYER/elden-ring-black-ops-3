@@ -1,0 +1,152 @@
+Performance patch for justbustin/minecraft-crossover-bridge at d1723873ec (MIT, see
+THIRD_PARTY_NOTICES.md). Apply in the bridge clone with `git apply`, then rebuild and install
+(elden-ring/scripts/install_er_bridge.sh, or reload_core.sh while the game runs).
+
+- memutil.cpp: mem_readable caches the regions VirtualQuery confirmed, for one game tick
+  (mem_cache_reset() at the start of task_tick). Under Wine and Rosetta each query is a slow
+  system call, and publishing entities made thousands a tick: 8.5 ms -> 0.1 ms in the Stranded
+  Graveyard, Elden Ring 25 -> 36 fps.
+- game.cpp: a "tick breakdown (ms)" log line every 300 ticks, per section.
+
+diff --git a/elden-ring/er-bridge/src/common.h b/elden-ring/er-bridge/src/common.h
+index 11b7ee2..5418a1d 100644
+--- a/elden-ring/er-bridge/src/common.h
++++ b/elden-ring/er-bridge/src/common.h
+@@ -33,6 +33,8 @@ bool control_snapshot(ErmcControl* out);
+ 
+ // memutil.cpp
+ bool mem_readable(const void* p, size_t len);
++// Forgets the readable regions cached by mem_readable (call once per game tick).
++void mem_cache_reset();
+ bool mem_read(const void* p, void* out, size_t len);
+ bool mem_write(void* p, const void* src, size_t len);
+ // Scan [start, end) for a masked byte pattern. mask byte 0xFF = must match, 0x00 = wildcard.
+diff --git a/elden-ring/er-bridge/src/game.cpp b/elden-ring/er-bridge/src/game.cpp
+index 22ab2f9..9d5a8c6 100644
+--- a/elden-ring/er-bridge/src/game.cpp
++++ b/elden-ring/er-bridge/src/game.cpp
+@@ -1868,6 +1868,13 @@ static void handle_switching() {
+ 
+ static DWORD g_tickThread = 0, g_camThread = 0;
+ 
++// Where the tick's time goes, logged every 300 ticks (perf instrumentation).
++static const char* const kSecNames[] = {"switching", "player+frame", "life", "stand-in", "passages",
++                                        "rays", "damage", "entities", "actions", "frame"};
++constexpr int kSecs = sizeof(kSecNames) / sizeof(kSecNames[0]);
++static double g_secMs[kSecs];
++static uint32_t g_secTicks = 0;
++
+ static void __fastcall task_tick(void* /*self*/, const void* /*data*/) {
+     InflightGuard guard;
+     if (!g_tickThread) {
+@@ -1876,8 +1883,17 @@ static void __fastcall task_tick(void* /*self*/, const void* /*data*/) {
+     }
+     LARGE_INTEGER t0, t1, fq;
+     QueryPerformanceCounter(&t0);
++    QueryPerformanceFrequency(&fq);
++    LARGE_INTEGER tp = t0, tm;
++    mem_cache_reset();
++    auto mark = [&](int i) {
++        QueryPerformanceCounter(&tm);
++        g_secMs[i] += (double)(tm.QuadPart - tp.QuadPart) * 1000.0 / fq.QuadPart;
++        tp = tm;
++    };
+     InterlockedExchange(&g_tickAlive, 1);
+     handle_switching();
++    mark(0);
+ 
+     Player p;
+     bool havePlayer = get_player(&p) && block_valid(p);
+@@ -1887,18 +1903,25 @@ static void __fastcall task_tick(void* /*self*/, const void* /*data*/) {
+         g_putHavokValid = false;
+         g_haveHmR = false;
+     }
++    mark(1);
+     update_life(havePlayer ? &p : nullptr);
++    mark(2);
+ 
+     ErmcControl c;
+     memset(&c, 0, sizeof(c));
+     bool ctrl = control_active(&c);
+     bool alive = havePlayer && g_life == LIFE_ALIVE;
+     if (havePlayer) stand_in(p, &c, alive && ctrl && (c.flags & ERMC_CTRL_MOVE_HUNTER));
++    mark(3);
+     update_passages(havePlayer && alive && g_standing, havePlayer ? p.ins : nullptr);
++    mark(4);
+     if (alive) {
+         service_rays(p.ins);
++        mark(5);
+         service_damage(p);      // before republishing: ids refer to last tick's table
++        mark(6);
+         publish_entities(p);
++        mark(7);
+         service_test_enemy(p);
+         service_action(p);
+         check_action_press();
+@@ -1906,12 +1929,22 @@ static void __fastcall task_tick(void* /*self*/, const void* /*data*/) {
+         clear_entities();
+     }
+     publish_prompt(alive && g_standing);
++    mark(8);
+ 
+     frame_claim_source();
+     on_frame();
++    mark(9);
+     QueryPerformanceCounter(&t1);
+-    QueryPerformanceFrequency(&fq);
+     perf_add_tick((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart);
++    if (++g_secTicks >= 300) {
++        char buf[512];
++        int n = 0;
++        for (int i = 0; i < kSecs; i++)
++            n += snprintf(buf + n, sizeof(buf) - n, "%s%s %.2f", i ? ", " : "", kSecNames[i], g_secMs[i] / g_secTicks);
++        log("tick breakdown (ms): %s", buf);
++        memset(g_secMs, 0, sizeof(g_secMs));
++        g_secTicks = 0;
++    }
+ }
+ 
+ static void __fastcall task_camera(void* /*self*/, const void* /*data*/) {
+diff --git a/elden-ring/er-bridge/src/memutil.cpp b/elden-ring/er-bridge/src/memutil.cpp
+index f629114..6cc2118 100644
+--- a/elden-ring/er-bridge/src/memutil.cpp
++++ b/elden-ring/er-bridge/src/memutil.cpp
+@@ -11,14 +11,37 @@ static bool protect_readable(DWORD p) {
+                  PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+ }
+ 
++// Readable regions VirtualQuery confirmed this tick. Under Wine and Rosetta each query is a
++// slow system call, and publishing entities checks several pointers for each of up to ~1,300
++// characters a tick (8.5 ms in the Stranded Graveyard). Characters live in a few large heap
++// regions, so after the first query almost every check is a range comparison. Per thread;
++// mem_cache_reset() at the start of each game tick keeps entries to one tick, as fresh as the
++// pointers they vouch for.
++namespace {
++struct Region {
++    uintptr_t lo, hi;
++};
++constexpr int kRegions = 32;
++thread_local Region t_regions[kRegions];
++thread_local int t_regionCount = 0, t_regionNext = 0;
++}  // namespace
++
++void mem_cache_reset() { t_regionCount = 0; t_regionNext = 0; }
++
+ bool mem_readable(const void* p, size_t len) {
+     uintptr_t a = (uintptr_t)p, end = a + len;
+     if (a < 0x10000 || end < a) return false;
++    for (int i = 0; i < t_regionCount; i++)
++        if (a >= t_regions[i].lo && end <= t_regions[i].hi) return true;
+     while (a < end) {
+         MEMORY_BASIC_INFORMATION mbi;
+         if (!VirtualQuery((void*)a, &mbi, sizeof(mbi))) return false;
+         if (mbi.State != MEM_COMMIT || !protect_readable(mbi.Protect)) return false;
+-        a = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
++        uintptr_t lo = (uintptr_t)mbi.BaseAddress, hi = lo + mbi.RegionSize;
++        t_regions[t_regionNext] = {lo, hi};
++        t_regionNext = (t_regionNext + 1) % kRegions;
++        if (t_regionCount < kRegions) t_regionCount++;
++        a = hi;
+     }
+     return true;
+ }
